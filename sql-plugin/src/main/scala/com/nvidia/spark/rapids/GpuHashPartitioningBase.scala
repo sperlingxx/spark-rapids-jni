@@ -16,8 +16,9 @@
 
 package com.nvidia.spark.rapids
 
-import ai.rapids.cudf.{DType, NvtxColor, NvtxRange, PartitionedTable}
+import ai.rapids.cudf.{DType, NvtxColor, NvtxRange, Table}
 import com.nvidia.spark.rapids.Arm.withResource
+import com.nvidia.spark.rapids.jni.TableOperation
 import com.nvidia.spark.rapids.shims.ShimExpression
 
 import org.apache.spark.sql.catalyst.expressions.Expression
@@ -32,16 +33,16 @@ abstract class GpuHashPartitioningBase(expressions: Seq[Expression], numPartitio
   override def nullable: Boolean = false
   override def dataType: DataType = IntegerType
 
+  override def usePaddingPartition: Boolean = true
+
   def partitionInternalAndClose(batch: ColumnarBatch): (Array[Int], Array[GpuColumnVector]) = {
     val types = GpuColumnVector.extractTypes(batch)
-    val partedTable = GpuHashPartitioningBase.hashPartitionAndClose(batch, expressions,
-      numPartitions, "Calculate part")
-    withResource(partedTable) { partedTable =>
-      val parts = partedTable.getPartitions
-      val tp = partedTable.getTable
-      val columns = (0 until partedTable.getNumberOfColumns.toInt).zip(types).map {
+    val (pt, parts) = GpuHashPartitioningBase.hashPartitionAndClose(batch, expressions,
+      numPartitions, usePaddingPartition && !usesGPUShuffle, "Calculate part")
+    withResource(pt) { partedTable =>
+      val columns = (0 until partedTable.getNumberOfColumns).zip(types).map {
         case (index, sparkType) =>
-          GpuColumnVector.from(tp.getColumn(index).incRefCount(), sparkType)
+          GpuColumnVector.from(partedTable.getColumn(index).incRefCount(), sparkType)
       }
       (parts, columns.toArray)
     }
@@ -66,7 +67,9 @@ object GpuHashPartitioningBase {
   val DEFAULT_HASH_SEED: Int = 42
 
   def hashPartitionAndClose(batch: ColumnarBatch, keys: Seq[Expression], numPartitions: Int,
-      nvtxName: String, seed: Int = DEFAULT_HASH_SEED): PartitionedTable = {
+      paddingPartition: Boolean,
+      nvtxName: String,
+      seed: Int = DEFAULT_HASH_SEED): (Table, Array[Int]) = {
     val sb = SpillableColumnarBatch(batch, SpillPriorities.ACTIVE_ON_DECK_PRIORITY)
     RmmRapidsRetryIterator.withRetryNoSplit(sb) { sb =>
       withResource(sb.getColumnarBatch()) { cb =>
@@ -79,7 +82,13 @@ object GpuHashPartitioningBase {
         }
         withResource(parts) { parts =>
           withResource(GpuColumnVector.from(cb)) { table =>
-            table.partition(parts, numPartitions)
+            if (paddingPartition) {
+              val pt = TableOperation.paddingPartition(table, parts, numPartitions)
+              (pt.getTable, pt.getPartitions)
+            } else {
+              val pt = table.partition(parts, numPartitions)
+              (pt.getTable, pt.getPartitions)
+            }
           }
         }
       }
